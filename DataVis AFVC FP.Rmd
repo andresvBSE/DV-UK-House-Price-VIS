@@ -1,0 +1,352 @@
+---
+title: "Analyzing UK Price Data"
+author: "Andres Felipe Virgüez"
+
+output:
+  html_document:
+    highlight: pygments
+    header-includes: \usepackage{graphicx}
+    code_folding:
+    toc: true
+    number_sections: true
+    toc_float: 
+        collapsed: TRUE
+        smooth_scroll: false
+    toc_depth: 2
+    self_contained: yes
+editor_options: 
+  chunk_output_type: inline
+
+
+---
+<style>
+
+.nav>li>a {
+    position: relative;
+    display: block;
+    padding: 10px 15px;
+    color: #2B8FA5;
+}
+.nav-pills>li.active>a, .nav-pills>li.active>a:hover, .nav-pills>li.active>a:focus {
+    color: #ffffff;
+    background-color: #2B8FA5;
+}
+
+.main-container {
+    max-width: 940px;
+    margin-left: 0;
+    margin-right: 0;
+}
+
+</style>
+
+
+
+**Set up of the project**:
+
+```{r, warning=FALSE, message=F, echo=F, results='hide'}
+# Clear the enviroment
+rm(list = ls())
+
+# Load or install libraries
+libraries_list = c("tidyverse", "leaflet", "dygraphs", "xts", "sp", "sf", "plotly", "rgdal", "geojsonio", "viridis")
+new_librariss <- libraries_list[!(libraries_list %in% installed.packages()[,"Package"])]
+if(length(new_librariss)) install.packages(new_librariss) # Aqui instalo las librerias que no estan
+lapply(libraries_list, library, character.only = TRUE) # Aqui cargo los paquetes
+
+
+# Set the current directory as the working directory 
+setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
+```
+
+Loading the data
+
+```{r, warning=FALSE, message=F, results='hide'}
+
+df = read_csv("data/ppdata_lite.csv")
+
+```
+
+## London Boroughs
+
+**What are the most and less expensive London Boroughs? **
+
+```{r, warning=FALSE, message=F, fig.width = 12, fig.align='center'}
+london_df = df %>% filter(county == 'GREATER LONDON') # Data set for only London
+london_df_2015 = london_df %>% filter(format(date_of_transfer, format = "%Y") == 2015) # Data set for only London
+
+# It's important to plot the average value for district so I create a new table with that information 
+london_avg_p = london_df_2015 %>% group_by(district) %>% summarise(price = mean(price)) %>% arrange(price)
+
+## House prices between Boroughs?
+ggplot(data = london_df_2015, 
+       aes(x = fct_relevel(district, rev(london_avg_p$district)), # In this line I indicate the order which is the reverse of the values in london_avg_p
+           y = price)) + 
+  geom_boxplot(outlier.size = 0.5, outlier.alpha = 0.3) + 
+  geom_point(data = london_avg_p, aes(x = district, y = price, color = 'red'), size = 1) + 
+  coord_flip() +
+  scale_y_log10() + 
+  labs(x = "London Boroughs", 
+       y = "Log of Price", 
+       color = "Mean Price") +
+  ggtitle("House Prices by Borough: London 2015") +
+  theme_minimal() + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1, size = 8))
+
+```
+
+The graph above shows that for 2015 Kensington and Chelsea was the borough with the highest median price in housing, however the average price (red points) was higher in the City of London.The City of Westminster is another expensive boroughs of London. On the other hand, according to the data Barking and Dagenham is the borough where the average and median prince of housing is the lowest.
+
+The next graph shows the distribution of housing prices in Londo for different years.
+
+```{r, warning=FALSE, message=F, fig.width = 12, fig.align='center'}
+
+## Data frame for London with the columns year
+london_df = london_df %>% mutate(Year_of_transfer = format(date_of_transfer, format = "%Y"))
+
+## House prices between Boroughs?
+ggplot(data = london_df %>% filter(Year_of_transfer %in% c(2013,2014,2015)), # Filtering london for the last previous years
+       aes(x = reorder(str_to_title(district), price, median, na.rm=T), # In this line I indicate the order which is the reverse of the values in london_avg_p
+           y = price)) + 
+  geom_boxplot(outlier.size = 0.5, outlier.alpha = 0.3) + 
+  coord_flip() +
+  scale_y_log10() + 
+  facet_wrap(~Year_of_transfer, ncol=3) + 
+  labs(x = "London Boroughs", 
+       y = "Log of Price", 
+       color = "Mean Price") +
+  ggtitle("House Prices by Borough: London 2013 - 2015") +
+  theme_minimal() + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1, size = 8))
+
+```
+From the years 2012 to 2014 using the median value  we can see that Kensington and Chelsea wes the most expensive Borough, followed by the City of Westminster and the City of London.
+
+## Price and floor level witht all of the UK data
+
+**Is there any relationship between price and floor levels? **:
+
+We want to see the relationship between price and floor level, however the data do not have explicitly the information of floor level, for this reason I will use the SAON column which is a text column with the information of location in the case of properties that are divide into separate unites such as flats (property_type == "F").
+
+Note: Given that there is not a specific column with the information of floor level I will try to retrieve the information of the floor using regular expressions, this exercise is biased since depends on the way the information of floor is filled (there is not an specific format) and the methods of extraction created.
+
+```{r, warning=FALSE, message=F, fig.width = 12, fig.align='center'}
+
+### Create the floor level (only for flats (property_type == "F"))) by extracting the information from SAON
+
+#### The next pipeline extracts as well as possible the information of the floor by the following proccess
+  #### 1 Using the strings to denote floors from basement to 9th floor
+  #### Taking the first digit in the case of floor numbers of two digits
+  #### Taking the first two digits in the case of floor numbers of three digits
+  #### Select up to 19 floors levels
+
+floor_price_df = df %>% 
+  filter(property_type == "F" & format(date_of_transfer, format = "%Y") == 2015) %>%
+  mutate(Floor_x = str_replace_all(SAON, c(".*BASEMENT.*" = "-1",
+                                         ".*GROUND.*" = "0",
+                                         ".*FIRST.*" = "1",
+                                         ".*SECOND*" = "2",
+                                         ".*THIRD*" = "3",
+                                         ".*FOURTH*" = "4",
+                                         ".*FIFTH*" = "5",
+                                         ".*SIXTH*" = "6",
+                                         ".*SEVENTH*" = "7",
+                                         ".*EIGHTH*" = "8",
+                                         ".*NINETH*" = "9",
+                                         "FLAT " = "",
+                                         "APARTMENT " = ""))) %>%
+  mutate(Floor_x = as.character(as.numeric(Floor_x))) %>% 
+  mutate(Floor_x = case_when(nchar(Floor_x) == 1 ~ Floor_x,
+                           nchar(Floor_x) == 2 & Floor_x != "-1" ~ str_sub(Floor_x, 1, 1),
+                           nchar(Floor_x) == 3 ~ str_sub(Floor_x, 1, 2)
+                           )) %>% 
+  mutate(Floor = as.numeric(Floor_x)) %>%
+  select(property_type, SAON, Floor, price) %>%
+  filter(Floor < 20) %>%
+  drop_na(Floor)
+
+# Run a regression between floor level a price
+lm1 = lm(log(price) ~ Floor, floor_price_df)
+reg_text = paste("log(price) =", round(lm1$coefficients[1],2), "+", round(lm1$coefficients[2],3), "floor_level")
+
+# Create a p graph with an annotation of the regression results
+## In this kind of situations is better to work with jitter isntead of point (geom_point)
+
+ggplot(data = floor_price_df, aes(x = Floor, y = price)) +
+  scale_y_log10() +
+  geom_jitter(alpha = 0.2, size = 0.5) +
+  geom_smooth(method='lm', formula = y ~ x) + 
+  annotate("text", x = 13, y = 1e+07, label = reg_text) +
+  labs(x = "Floor level", 
+       y = "Log of Price") +
+  ggtitle("Floor level vs. price") +
+  theme_minimal()
+
+```
+
+The graph above shows a very small association between floor level and the prices. The results of running a OLS regression indicate that on average as the floor level increases the housing price increases in 1.4%.
+
+## Differences of prices for UK regions
+
+
+```{r, warning=FALSE, message=F, fig.align='center', results='hide'}
+
+## Load the uk geo zip codes with longitude and latitude to create maps
+uk_postcodes_list <- read.csv("data/ukpostcodes.csv", header = TRUE, sep = ',')
+
+## Convert the postcodes list into a simple shapefile
+uk_postcodes_sf_4 <- st_as_sf(uk_postcodes_list, coords = c('longitude', 'latitude'), crs = st_crs(4326))
+uk_postcodes_sf_2 = st_transform(uk_postcodes_sf_4, 2163)
+
+## Load UK shape files (administrative boundaries) and transform the cordinates system to 2163
+uk_shapefiles <- st_read("data/shapefiles/postcode_shapefile.shp")
+uk_shapefiles_sf <- st_transform(uk_shapefiles, 2163) # To match uk_postcodes_sf_2 afterwards
+
+## Create the postcode district column in uk_postcodes_sf_4 that is the interception of 
+## the shapefiles of postcodes and administrative boundaries of UK
+uk_postcodes_sf_4 = uk_postcodes_sf_4 %>%
+                      mutate(postcode_district = as.integer(st_intersects(uk_postcodes_sf_2, uk_shapefiles_sf)))
+
+
+# Rename and select columns
+uk_shapefiles = uk_shapefiles %>% 
+                    select(fid, geometry) %>%
+                    rename(postcode_district = fid) %>%
+                    mutate(postcode_district = as.integer(postcode_district))
+
+
+## Add the information of prices 
+### First: summarize of prices by zip code
+price_zip =  df %>% 
+    left_join(uk_postcodes_sf_4) %>% 
+    filter(format(date_of_transfer, format = "%Y") == 2015) %>%
+    group_by(postcode_district) %>%
+    summarise(`Mean price` = mean(price),
+              `Median price` = median(price),
+              `Min price` = min(price),
+              `Max price` = max(price))
+
+
+# Add the shapes (geom columns) to the df that has the average values
+final_geom_df = price_zip %>% 
+  inner_join(uk_shapefiles)
+
+rm(floor_price_df, price_zip, uk_postcodes_list, uk_postcodes_sf_2, uk_postcodes_sf_4, uk_shapefiles, uk_shapefiles_sf)
+
+```
+
+```{r, warning=FALSE, message=F, fig.align='center'}
+
+##### Map 1 median price
+ggplotmap1 = ggplot(final_geom_df) +
+  geom_sf(aes(geometry = geometry, fill = log(`Median price`))) + 
+  coord_sf() +
+  ggtitle("Median price by Postcode District in the UK: 2015") +
+  labs(fill = "Median Price") +
+  scale_fill_viridis(direction = -1) + 
+  scale_color_viridis(direction = -1) +
+  theme_void() + 
+  theme(panel.grid.major = element_blank(),
+                panel.grid.minor = element_blank(),
+                panel.border = element_blank(),
+                panel.background = element_blank())
+
+ggplotly(ggplotmap1)
+
+```
+
+
+The graph using the median values looks saturated, but this happens mainly because of the amount of regions plotted (more than 2363). Let's see how does the average prices look like?
+
+```{r, warning=FALSE, message=F, fig.align='center'}
+
+##### Map 2 mean value
+ggplotmap2 = ggplot(final_geom_df) +
+  geom_sf(aes(geometry = geometry, fill = log(`Mean price`))) + 
+  coord_sf() +
+  ggtitle("Average price by Postcode District in the UK: 2015") +
+  labs(fill = "Average Price") +
+  scale_fill_viridis(direction = -1) + 
+  scale_color_viridis(direction = -1) +
+  theme_void() + 
+  theme(panel.grid.major = element_blank(),
+                panel.grid.minor = element_blank(),
+                panel.border = element_blank(),
+                panel.background = element_blank())
+
+
+ggplotly(ggplotmap2)
+
+```
+
+
+The results does not improve given that the map is still saturated by the high number of zones. However as well as in the map of the the median values of housing we can see that in the north of the country there is a zone with lower prices in housing.
+
+
+Subtitle: "Variation of prices during the year"
+
+**Did the prices change throughout the year (2015) **:
+
+```{r, warning=FALSE, message=F, fig.width = 12, fig.align='center'}
+
+df = df %>%
+              mutate(year_transfer = format(date_of_transfer, format = "%Y"),
+                     month_transfer = format(date_of_transfer, format = "%m")) %>% 
+              mutate(season = case_when(month_transfer %in% c("01", "02", "03") ~ "winter",
+                                        month_transfer %in% c("04", "05", "06") ~ "spring",
+                                        month_transfer %in% c("07", "08", "09") ~ "summer",
+                                        month_transfer %in% c("10", "11", "12") ~ "fall"))
+
+            
+# Relation between month of the year and price by status: old/new
+ggplot(data = df %>% filter(year_transfer == 2015), 
+       aes(x = month_transfer, y = price, fill = old_new)) +
+  scale_y_log10() +
+  geom_boxplot(outlier.size = 0.5, outlier.alpha = 0.3) +
+  labs(x = "Month", 
+       y = "Log of Price",
+       fill = 'Old/New houses') +
+  ggtitle("Price vs month of the year: Uk 2015") +
+  theme_minimal()
+
+
+```
+
+As expected new houses are more costly that old ones, and the distribution of prices remains steady throughout 2015. Let's see now the behaviur of prices under other features.
+
+```{r, warning=FALSE, message=F, fig.width = 12, fig.align='center'}
+
+# Relation between month of the year and price
+ggplot(data = df %>% filter(year_transfer == 2015), 
+       aes(x = month_transfer, y = price, fill = property_type)) +
+  scale_y_log10() +
+  geom_boxplot(outlier.size = 0.5, outlier.alpha = 0.3) +
+  labs(x = "Month", 
+       y = "Log of Price",
+       fill = 'Property type') +
+  ggtitle("Price vs month of the year: Uk 2015") +
+  theme_minimal()
+
+```
+For 2015 in  all of the months of the year the distribution of prices remains the same, even by distinguishing the type of property among the five categories (D = Detached, S = Semi-Detached, T = Terraced, F = Flats/Maisonettes, O = Other).
+
+
+```{r, warning=FALSE, message=F, fig.width = 12, fig.align='center'}
+
+# Relation between month of the year and price
+ggplot(data = df %>% filter(year_transfer %in% c(2013,2014,2015)), 
+       aes(x = fct_relevel(season, c('sprint', 'summer', 'fall', 'winter')), y = price, fill = year_transfer)) +
+  #scale_y_log10() +
+  scale_y_log10(limits = quantile(df$price, c(0.01, 0.91))) +
+  geom_boxplot(outlier.shape = NA) +
+  facet_wrap(~property_type) +
+  labs(x = "Season", 
+       y = "Log of Price",
+       fill = 'Year sold') +
+  ggtitle("Price vs season of the year: Uk 2013 - 2015") +
+  theme_minimal()
+
+```
+According to the graph above all of the types of houses follow the same trend in price throughout the seasons of the year. There is an atypical behavior for 2013 for the prices of other type of houses due to the sample is not representative for these period of time.
+
+
